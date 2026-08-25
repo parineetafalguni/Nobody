@@ -1,0 +1,32 @@
+
+const express=require('express'),crypto=require('crypto');
+const {pool}=require('../db'); const router=express.Router(); const sessions=new Map(); const TTL=600000;
+const hp=(p,s=crypto.randomBytes(16).toString('hex'))=>`${s}:${crypto.scryptSync(p,s,64).toString('hex')}`;
+function vp(p,x){const [s,h]=String(x).split(':');if(!s||!h)return false;const a=crypto.scryptSync(p,s,64).toString('hex');return crypto.timingSafeEqual(Buffer.from(h,'hex'),Buffer.from(a,'hex'))}
+const ho=x=>crypto.createHash('sha256').update(x).digest('hex');
+/* Sends mail via Brevo's HTTPS API (port 443) instead of raw SMTP, because
+   Render's free tier blocks outbound SMTP ports (25/465/587). Requires
+   BREVO_API_KEY and EMAIL_FROM env vars. Get a free API key at brevo.com
+   (Settings -> SMTP & API -> API Keys) and verify EMAIL_FROM as a sender there. */
+async function mail(to,otp){
+  const resp=await fetch('https://api.brevo.com/v3/smtp/email',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','api-key':process.env.BREVO_API_KEY},
+    body:JSON.stringify({
+      sender:{email:process.env.EMAIL_FROM},
+      to:[{email:to}],
+      subject:'Nobody verification code',
+      textContent:`Your Nobody verification code is ${otp}. It expires in 10 minutes.`
+    })
+  });
+  if(!resp.ok){const t=await resp.text().catch(()=>'');throw new Error(`Brevo send failed (${resp.status}): ${t}`)}
+}
+const pub=u=>({email:u.email,profile:u.profile});
+router.post('/signup/request-otp',async(req,res)=>{try{let email=String(req.body.email||'').trim().toLowerCase(),username=String(req.body.username||'').trim(),password=String(req.body.password||'');if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:'Enter a valid email address.'});if(!/^[A-Za-z0-9_]{3,30}$/.test(username))return res.status(400).json({error:'Anonymous name must be 3–30 characters.'});if(password.length<8)return res.status(400).json({error:'Password must be at least 8 characters.'});if((await pool.query('SELECT 1 FROM users WHERE email=$1',[email])).rowCount)return res.status(409).json({error:'Email already registered.'});if((await pool.query(`SELECT 1 FROM users WHERE LOWER(profile->>'name')=LOWER($1)`,[username])).rowCount)return res.status(409).json({error:'Anonymous name already taken.'});let otp=String(crypto.randomInt(100000,1000000));await pool.query(`INSERT INTO otp_requests(email,otp_hash,expires_at,username,password_hash) VALUES($1,$2,$3,$4,$5) ON CONFLICT(email) DO UPDATE SET otp_hash=$2,expires_at=$3,username=$4,password_hash=$5,attempts=0`,[email,ho(otp),Date.now()+TTL,username,hp(password)]);await mail(email,otp);res.json({ok:true})}catch(e){console.error(e);res.status(500).json({error:'Could not send verification code.'})}});
+router.post('/signup/verify-otp',async(req,res)=>{try{let email=String(req.body.email||'').trim().toLowerCase(),otp=String(req.body.otp||'').trim(),q=await pool.query('SELECT * FROM otp_requests WHERE email=$1',[email]);if(!q.rowCount)return res.status(400).json({error:'No pending verification.'});let p=q.rows[0];if(Date.now()>+p.expires_at)return res.status(400).json({error:'Code expired.'});if(p.attempts>=5)return res.status(429).json({error:'Too many attempts.'});await pool.query('UPDATE otp_requests SET attempts=attempts+1 WHERE email=$1',[email]);if(ho(otp)!==p.otp_hash)return res.status(400).json({error:'Incorrect code.'});let profile={name:p.username,bio:'',ageRange:'18–24',joined:new Date().toLocaleDateString('en-US',{month:'short',year:'numeric'}),badges:['🌱 New Member'],interests:[],avatarUrl:null,stats:{posts:0,responsesGiven:0}};let u=(await pool.query('INSERT INTO users(email,password_hash,verified,profile) VALUES($1,$2,TRUE,$3) RETURNING *',[email,p.password_hash,JSON.stringify(profile)])).rows[0];await pool.query('DELETE FROM otp_requests WHERE email=$1',[email]);let token=crypto.randomBytes(32).toString('hex');sessions.set(token,email);res.status(201).json({sessionId:token,user:pub(u)})}catch(e){console.error(e);res.status(500).json({error:'Could not create account.'})}});
+router.post('/signup/resend-otp',async(req,res)=>{try{let email=String(req.body.email||'').trim().toLowerCase(),q=await pool.query('SELECT * FROM otp_requests WHERE email=$1',[email]);if(!q.rowCount)return res.status(400).json({error:'No pending signup.'});let otp=String(crypto.randomInt(100000,1000000));await pool.query('UPDATE otp_requests SET otp_hash=$1,expires_at=$2,attempts=0 WHERE email=$3',[ho(otp),Date.now()+TTL,email]);await mail(email,otp);res.json({ok:true})}catch(e){res.status(500).json({error:'Could not resend code.'})}});
+router.post('/signin',async(req,res)=>{try{let email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||''),q=await pool.query('SELECT * FROM users WHERE email=$1',[email]);if(!q.rowCount||!q.rows[0].verified||!vp(password,q.rows[0].password_hash))return res.status(401).json({error:'Incorrect email or password.'});let token=crypto.randomBytes(32).toString('hex');sessions.set(token,email);res.json({sessionId:token,user:pub(q.rows[0])})}catch(e){res.status(500).json({error:'Sign in failed.'})}});
+router.get('/me',async(req,res)=>{let e=sessions.get(req.header('x-session-id'));if(!e)return res.status(401).json({error:'Session expired.'});let q=await pool.query('SELECT * FROM users WHERE email=$1',[e]);if(!q.rowCount)return res.status(401).json({error:'Session expired.'});res.json(pub(q.rows[0]))});
+router.delete('/session',(req,res)=>{sessions.delete(req.header('x-session-id'));res.json({ok:true})});
+async function requireSession(req,res,next){let e=sessions.get(req.header('x-session-id'));if(!e)return res.status(401).json({error:'Authentication required.'});let q=await pool.query('SELECT * FROM users WHERE email=$1',[e]);if(!q.rowCount)return res.status(401).json({error:'Authentication required.'});req.user=q.rows[0];next()}
+module.exports={router,requireSession};
